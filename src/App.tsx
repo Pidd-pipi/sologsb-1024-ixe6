@@ -82,6 +82,7 @@ import {
 import { useEffect, useMemo, useState } from 'react';
 import {
   colorPresets,
+  collectDownstreamIds,
   detectConflicts,
   roleLabels,
   statusLabels
@@ -139,7 +140,7 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
       style={style}
       role="option"
       aria-selected={selected}
-      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突`}
+      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突${(cue.delayShift ?? 0) > 0 ? `，现场顺延后移 ${cue.delayShift} 秒` : ''}`}
       className={`cue-row ${selected ? 'active' : ''} ${isDragging ? 'dragging' : ''}`}
       borderBottomWidth="1px"
       borderColor="whiteAlpha.100"
@@ -171,6 +172,11 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
           <Flex align="center" gap={2}>
             <Text fontWeight="650" noOfLines={1}>{cue.label}</Text>
             {cue.followCueId ? <Tag size="sm" variant="subtle" colorScheme="purple">跟随</Tag> : null}
+            {cue.delaySeconds ? (
+              <Tag size="sm" colorScheme="amber">顺延 +{cue.delaySeconds}s</Tag>
+            ) : (cue.delayShift ?? 0) > 0 ? (
+              <Tag size="sm" variant="subtle" colorScheme="orange">后移 +{cue.delayShift}s</Tag>
+            ) : null}
           </Flex>
           <Text color="whiteAlpha.500" fontSize="xs" noOfLines={1}>
             {cue.position} · {cue.channel} · {cue.color}
@@ -250,18 +256,31 @@ interface InspectorProps {
   roles: UserRole;
   workspace: Workspace;
   canEdit: boolean;
+  canDelay: boolean;
   conflicts: CueConflict[];
   onApply: (draft: Cue) => void;
   onDelete: () => void;
   onSelectCue: (cueId: string) => void;
+  onDelayChange: (cueId: string, seconds: number | undefined) => void;
 }
 
-function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDelete, onSelectCue }: InspectorProps) {
+function CueInspector({ cue, scene, workspace, canEdit, canDelay, conflicts, onApply, onDelete, onSelectCue, onDelayChange }: InspectorProps) {
   const [draft, setDraft] = useState<Cue | null>(cue ? structuredClone(cue) : null);
+  const [delayText, setDelayText] = useState(cue?.delaySeconds?.toString() ?? '');
 
   useEffect(() => {
     setDraft(cue ? structuredClone(cue) : null);
   }, [cue?.id]);
+
+  // 顺延输入框与方案数据同步；正在输入的中间值（如 "1."）与已提交值等价时保留原文
+  useEffect(() => {
+    const next = cue?.delaySeconds;
+    setDelayText((current) => {
+      if (next === undefined) return current.trim() === '' ? current : '';
+      if (current.trim() !== '' && Number.parseFloat(current) === next) return current;
+      return String(next);
+    });
+  }, [cue?.id, cue?.delaySeconds]);
 
   if (!cue || !draft) {
     return (
@@ -278,12 +297,19 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
     setDraft((current) => (current ? { ...current, [key]: value } : current));
   };
 
+  const downstreamCount = collectDownstreamIds(scene, cue.id).size;
+  const delayShift = cue.delayShift ?? 0;
+
   return (
     <VStack align="stretch" spacing={4}>
       <Flex align="center">
         <Box>
           <Heading size="sm">{cue.number} · {cue.label}</Heading>
-          <Text color="whiteAlpha.500" fontSize="xs">开始 {formatTime(cue.startTime)} · 总时长 {cue.duration?.toFixed(1)}s</Text>
+          <Text color="whiteAlpha.500" fontSize="xs">
+            开始 {formatTime(cue.startTime)}
+            {delayShift > 0 ? `（计划 ${formatTime((cue.startTime ?? 0) - delayShift)}）` : ''}
+            {' '}· 总时长 {cue.duration?.toFixed(1)}s
+          </Text>
         </Box>
         <Spacer />
         <Tag colorScheme={statusColors[cue.status]}>{statusLabels[cue.status]}</Tag>
@@ -293,7 +319,13 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
         <Alert status="warning" borderRadius="lg">
           <AlertIcon />
           <AlertDescription fontSize="sm">
-            {scene.frozen ? '该场次已冻结。解除冻结后才能修改。' : '当前角色只能查看或执行场次冻结，不能修改提示参数。'}
+            {scene.frozen
+              ? canDelay
+                ? '该场次已冻结，提示参数只读；但仍可填写现场顺延。'
+                : '该场次已冻结。解除冻结后才能修改。'
+              : canDelay
+                ? '当前角色不能修改提示参数，但可以填写现场顺延。'
+                : '当前角色只能查看或执行场次冻结，不能修改提示参数。'}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -378,6 +410,62 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
           </FormControl>
         ))}
       </SimpleGrid>
+
+      <FormControl>
+        <FormLabel htmlFor="cue-delay">
+          <HStack spacing={1}><Clock3 size={13} /><Text>现场顺延（秒）</Text></HStack>
+        </FormLabel>
+        <HStack>
+          <NumberInput
+            id="cue-delay"
+            min={0}
+            step={0.5}
+            precision={1}
+            value={delayText}
+            isDisabled={!canDelay}
+            onChange={(text, value) => {
+              setDelayText(text);
+              if (!text.trim()) {
+                onDelayChange(cue.id, undefined);
+              } else if (!Number.isNaN(value)) {
+                onDelayChange(cue.id, Math.max(0, value));
+              }
+            }}
+          >
+            <NumberInputField placeholder="留空按计划时间" />
+            <NumberInputStepper>
+              <NumberIncrementStepper />
+              <NumberDecrementStepper />
+            </NumberInputStepper>
+          </NumberInput>
+          <Button
+            size="sm"
+            variant="ghost"
+            flexShrink={0}
+            isDisabled={!canDelay || !(cue.delaySeconds ?? 0)}
+            onClick={() => {
+              setDelayText('');
+              onDelayChange(cue.id, undefined);
+            }}
+          >
+            清空
+          </Button>
+        </HStack>
+        {cue.delaySeconds ? (
+          <Text mt={1} color="amber.200" fontSize="11px">
+            已顺延 {cue.delaySeconds}s：计划 {formatTime((cue.startTime ?? 0) - delayShift)} → 现场 {formatTime(cue.startTime)}
+            {downstreamCount ? `，${downstreamCount} 条下游跟随提示一起后移` : ''}。清空延迟即恢复计划时间。
+          </Text>
+        ) : delayShift > 0 ? (
+          <Text mt={1} color="orange.200" fontSize="11px">
+            跟随链上游已顺延，本提示随之后移 {delayShift}s（计划 {formatTime((cue.startTime ?? 0) - delayShift)} → 现场 {formatTime(cue.startTime)}）。
+          </Text>
+        ) : (
+          <Text mt={1} color="whiteAlpha.500" fontSize="11px">
+            演员晚点或节奏拖慢时填写延迟秒数；本提示及所有下游跟随提示一起后移，其他提示仍按原计划时间。
+          </Text>
+        )}
+      </FormControl>
 
       <FormControl>
         <FormLabel htmlFor="cue-follow">跟随关系</FormLabel>
@@ -545,7 +633,10 @@ function ComparePlan({
               <Text fontFamily="mono" fontSize="xs" color="amber.300" w="42px">{cue.number}</Text>
               <Box flex="1" minW={0}>
                 <Text fontSize="xs" noOfLines={1}>{cue.label}</Text>
-                <Text color="whiteAlpha.500" fontSize="10px">{formatTime(cue.startTime)} · {cue.channel} · {cue.brightness}%</Text>
+                <Text color="whiteAlpha.500" fontSize="10px">
+                  {formatTime(cue.startTime)} · {cue.channel} · {cue.brightness}%
+                  {(cue.delayShift ?? 0) > 0 ? <Text as="span" color="amber.300"> · 顺延+{cue.delayShift}s</Text> : null}
+                </Text>
               </Box>
               {active ? (
                 <IconButton aria-label={`选择 ${cue.number}`} size="xs" variant="ghost" icon={<ChevronRight size={14} />} onClick={() => onSelectCue(cue.id)} />
@@ -584,6 +675,8 @@ export default function App() {
     ? allConflicts.filter((item) => item.cueId === selectedCue.id)
     : [];
   const editable = canEditScene(workspace.role, activeScene);
+  // 现场顺延后于演出执行：可编辑角色均可填写，舞台监督在冻结场次也能记录
+  const canDelay = editable || workspace.role === 'stage-manager';
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
 
@@ -644,10 +737,26 @@ export default function App() {
         ?.scenes.find((scene) => scene.id === next.selectedSceneId)
         ?.cues.find((item) => item.id === draft.id);
       if (!cue) return;
-      const { startTime: _start, duration: _duration, endTime: _end, ...fields } = draft;
+      const { startTime: _start, duration: _duration, endTime: _end, delayShift: _shift, delaySeconds: _delay, ...fields } = draft;
       Object.assign(cue, fields);
     });
     toast({ title: '提示参数已应用', status: 'success', duration: 1800 });
+  }
+
+  function setLiveDelay(cueId: string, seconds: number | undefined) {
+    const number = activeScene?.cues.find((item) => item.id === cueId)?.number ?? '';
+    commit(
+      seconds === undefined ? `清空 ${number} 的现场顺延，恢复计划时间` : `${number} 现场顺延 ${seconds} 秒`,
+      (next) => {
+        const cue = next.plans
+          .find((plan) => plan.id === next.activePlanId)
+          ?.scenes.find((scene) => scene.id === next.selectedSceneId)
+          ?.cues.find((item) => item.id === cueId);
+        if (!cue) return;
+        if (seconds === undefined) delete cue.delaySeconds;
+        else cue.delaySeconds = seconds;
+      }
+    );
   }
 
   function deleteCue() {
@@ -801,9 +910,22 @@ export default function App() {
   }
 
   function exportPlan() {
+    const liveDelays = activePlan.scenes.flatMap((scene) =>
+      scene.cues
+        .filter((cue) => (cue.delaySeconds ?? 0) > 0)
+        .map((cue) => ({
+          sceneId: scene.id,
+          sceneName: scene.name,
+          cueId: cue.id,
+          number: cue.number,
+          label: cue.label,
+          delaySeconds: cue.delaySeconds
+        }))
+    );
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
+      liveDelays,
       conflicts: activeConflicts,
       role: workspace.role
     };
@@ -1005,7 +1127,7 @@ export default function App() {
                   </Flex>
                   <Flex className="timeline-track" role="list" aria-label={`${activeScene.name}时间轴`}>
                     {activeScene.cues.map((cue) => (
-                      <Tooltip key={cue.id} label={`${cue.number} ${cue.label}，${formatTime(cue.startTime)} 开始，持续 ${cue.duration?.toFixed(1)} 秒`}>
+                      <Tooltip key={cue.id} label={`${cue.number} ${cue.label}，${formatTime(cue.startTime)} 开始，持续 ${cue.duration?.toFixed(1)} 秒${(cue.delayShift ?? 0) > 0 ? `，现场顺延后移 ${cue.delayShift} 秒` : ''}`}>
                         <Box
                           as="button"
                           role="listitem"
@@ -1016,6 +1138,7 @@ export default function App() {
                           flexGrow={Math.max(1, cue.duration ?? 1)}
                           flexBasis={`${Math.max(40, (cue.duration ?? 1) * 14)}px`}
                           borderLeft={cue.id === selectedCue?.id ? '3px solid #f6c453' : undefined}
+                          borderBottom={(cue.delayShift ?? 0) > 0 ? '3px solid rgba(246,196,83,.9)' : undefined}
                           onClick={() => selectCue(activeScene.id, cue.id)}
                         >
                           <Text fontWeight="800">{cue.number}</Text>
@@ -1085,10 +1208,12 @@ export default function App() {
                       roles={workspace.role}
                       workspace={workspace}
                       canEdit={editable}
+                      canDelay={canDelay}
                       conflicts={activeCueConflicts}
                       onApply={applyCue}
                       onDelete={deleteCue}
                       onSelectCue={(cueId) => selectCue(activeScene.id, cueId)}
+                      onDelayChange={setLiveDelay}
                     />
                   ) : null}
                 </TabPanel>
@@ -1110,6 +1235,7 @@ export default function App() {
                               <Text fontFamily="mono" color="amber.300" fontSize="sm">{cue.number}</Text>
                               <Text fontWeight="600" fontSize="sm" noOfLines={1}>{cue.label}</Text>
                               <Spacer />
+                              {(cue.delayShift ?? 0) > 0 ? <Tag size="sm" variant="subtle" colorScheme="amber">后移 +{cue.delayShift}s</Tag> : null}
                               <Text color="whiteAlpha.500" fontSize="xs">{formatTime(cue.startTime)}</Text>
                             </Flex>
                             <Box ml={4} mt={3} borderLeftWidth="2px" borderColor={followed ? 'purple.400' : 'whiteAlpha.200'} pl={3}>

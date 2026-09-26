@@ -15,9 +15,13 @@ export interface Cue {
   hold: number;
   fadeOut: number;
   followCueId: string;
+  /** 现场顺延秒数：只后移本提示及直接/间接跟随它的下游提示，其余提示保持计划时间 */
+  delaySeconds?: number;
   targetNote: string;
   notes: string;
   status: CueStatus;
+  /** 重算后的实际后移量（含上游顺延沿跟随链的传播），0 表示按计划时间 */
+  delayShift?: number;
   startTime?: number;
   duration?: number;
   endTime?: number;

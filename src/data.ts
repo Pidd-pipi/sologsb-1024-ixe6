@@ -143,22 +143,74 @@ export function recalculatePlans(plans: LightingPlan[]) {
     for (const scene of scenes) {
       scene.startTime = absoluteCursor;
       let sceneCursor = absoluteCursor;
+      // 第一遍：按计划顺序计算未顺延时间，只引用本次计算结果，避免上一轮的顺延值混入计划时间
+      const planned = new Map<string, { start: number; end: number }>();
       for (const item of scene.cues) {
         const duration = Math.max(0.1, item.fadeIn + item.hold + item.fadeOut);
         item.duration = Number(duration.toFixed(2));
+        const followedPlanned = item.followCueId ? planned.get(item.followCueId) : undefined;
+        const followTime = followedPlanned ? followedPlanned.end : sceneCursor;
+        const start = Number(Math.max(sceneCursor, followTime).toFixed(2));
+        const end = Number((start + duration).toFixed(2));
+        planned.set(item.id, { start, end });
+        sceneCursor = Math.max(sceneCursor, end);
+      }
+      const plannedSceneEnd = sceneCursor;
+      // 第二遍：现场顺延沿跟随链传播，直接和间接下游一起后移，其余提示保持计划时间
+      const shifts = new Map<string, number>();
+      const resolveShift = (item: Cue, visiting: Set<string>): number => {
+        const cached = shifts.get(item.id);
+        if (cached !== undefined) return cached;
+        if (visiting.has(item.id)) return 0;
+        visiting.add(item.id);
         const followed = item.followCueId
           ? scene.cues.find((candidate) => candidate.id === item.followCueId)
           : undefined;
-        const followTime = followed?.endTime ? followed.endTime : sceneCursor;
-        item.startTime = Number(Math.max(sceneCursor, followTime).toFixed(2));
-        item.endTime = Number((item.startTime + duration).toFixed(2));
-        sceneCursor = Math.max(sceneCursor, item.endTime);
+        const inherited = followed ? resolveShift(followed, visiting) : 0;
+        visiting.delete(item.id);
+        const shift = Math.max(0, item.delaySeconds ?? 0) + inherited;
+        shifts.set(item.id, shift);
+        return shift;
+      };
+      let liveSceneEnd = plannedSceneEnd;
+      for (const item of scene.cues) {
+        const shift = resolveShift(item, new Set<string>());
+        const base = planned.get(item.id);
+        item.delayShift = Number(shift.toFixed(2));
+        item.startTime = Number(((base?.start ?? 0) + shift).toFixed(2));
+        item.endTime = Number((item.startTime + (item.duration ?? 0)).toFixed(2));
+        liveSceneEnd = Math.max(liveSceneEnd, item.endTime);
       }
-      scene.duration = Number(Math.max(0, sceneCursor - absoluteCursor).toFixed(2));
-      absoluteCursor = sceneCursor;
+      scene.duration = Number(Math.max(0, liveSceneEnd - absoluteCursor).toFixed(2));
+      // 场次游标仍按计划时长推进，后续场次的提示不受本场顺延影响
+      absoluteCursor = plannedSceneEnd;
     }
   }
   return plans;
+}
+
+/** 收集直接和间接跟随指定提示的所有下游提示 */
+export function collectDownstreamIds(scene: Scene, cueId: string) {
+  const downstream = new Set<string>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of scene.cues) {
+      if (item.id === cueId || downstream.has(item.id)) continue;
+      if (item.followCueId && (item.followCueId === cueId || downstream.has(item.followCueId))) {
+        downstream.add(item.id);
+        changed = true;
+      }
+    }
+  }
+  return downstream;
+}
+
+/** 冲突信息中补充现场顺延原因，说明哪些提示被后移了多少 */
+function delayNote(cues: Cue[]) {
+  const shifted = cues.filter((item) => (item.delayShift ?? 0) > 0.001);
+  if (!shifted.length) return '';
+  return `（现场顺延：${shifted.map((item) => `${item.number} 后移 ${item.delayShift}s`).join('、')}）`;
 }
 
 export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
@@ -207,6 +259,16 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             type: 'follow-order',
             message: `${item.number} 的跟随目标不在其之前完成`
           });
+        } else if ((item.startTime ?? 0) < (followed.endTime ?? 0) - 0.01) {
+          conflicts.push({
+            id: `${plan.id}-${scene.id}-${item.id}-follow-early`,
+            planId: plan.id,
+            sceneId: scene.id,
+            cueId: item.id,
+            severity: 'warning',
+            type: 'follow-order',
+            message: `${item.number} 在跟随目标 ${followed.number} 结束前就开始${delayNote([followed, item])}`
+          });
         }
       }
 
@@ -221,7 +283,7 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             cueId: item.id,
             severity: 'warning',
             type: 'channel-overlap',
-            message: `${previous.number} 与 ${item.number} 在同通道 ${item.channel} 叠光`
+            message: `${previous.number} 与 ${item.number} 在同通道 ${item.channel} 叠光${delayNote([previous, item])}`
           });
         }
         byChannel.set(item.channel, [...(byChannel.get(item.channel) ?? []), item]);
