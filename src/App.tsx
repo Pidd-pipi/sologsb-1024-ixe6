@@ -79,9 +79,10 @@ import {
   Wifi,
   WifiOff
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   colorPresets,
+  collectDownstreamCueIds,
   detectConflicts,
   roleLabels,
   statusLabels
@@ -90,9 +91,11 @@ import {
   LIGHTING_STORAGE_KEY,
   canEditScene,
   canFreeze,
+  canRegisterDelay,
   findActivePlan,
   findActiveScene,
   findActiveCue,
+  formatDelay,
   formatTime,
   useLightingDesk
 } from './state/useLightingDesk';
@@ -107,7 +110,9 @@ const statusColors = {
 function conflictLabel(conflict: CueConflict) {
   return {
     'channel-overlap': '通道叠光',
+    'live-channel-overlap': '现场叠光（顺延）',
     'follow-order': '跟随关系',
+    'live-follow-order': '跟随早于结束（顺延）',
     'missing-data': '数据缺失',
     'duplicate-position': '灯位重复',
     duration: '时间异常'
@@ -139,7 +144,7 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
       style={style}
       role="option"
       aria-selected={selected}
-      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突`}
+      aria-label={`${cue.number} ${cue.label}，${statusLabels[cue.status]}，${conflicts.length} 个冲突${(cue.liveShift ?? 0) > 0 ? `，现场顺延 ${formatDelay(cue.liveShift)}` : ''}`}
       className={`cue-row ${selected ? 'active' : ''} ${isDragging ? 'dragging' : ''}`}
       borderBottomWidth="1px"
       borderColor="whiteAlpha.100"
@@ -162,15 +167,27 @@ function SortableCueRow({ cue, index, selected, disabled, conflicts, onSelect }:
         <Text w="42px" color="whiteAlpha.500" fontFamily="mono" fontSize="xs">
           {(index + 1).toString().padStart(2, '0')}
         </Text>
-        <Box w="84px">
+        <Box w="96px">
           <Text fontFamily="mono" fontWeight="700" color="amber.300">{cue.number}</Text>
-          <Text color="whiteAlpha.500" fontSize="10px">{formatTime(cue.startTime)}</Text>
+          {(cue.liveShift ?? 0) > 0 ? (
+            <>
+              <Text color="orange.300" fontSize="10px" fontFamily="mono">
+                {formatTime(cue.liveStartTime)} <Text as="span" color="orange.400">{formatDelay(cue.liveShift)}</Text>
+              </Text>
+              <Text color="whiteAlpha.400" fontSize="10px" fontFamily="mono" textDecoration="line-through">
+                {formatTime(cue.startTime)}
+              </Text>
+            </>
+          ) : (
+            <Text color="whiteAlpha.500" fontSize="10px" fontFamily="mono">{formatTime(cue.startTime)}</Text>
+          )}
         </Box>
         <Box className="color-swatch" bg={cue.colorHex} boxSize="14px" flexShrink={0} />
         <Box minW={0} flex="1">
           <Flex align="center" gap={2}>
             <Text fontWeight="650" noOfLines={1}>{cue.label}</Text>
             {cue.followCueId ? <Tag size="sm" variant="subtle" colorScheme="purple">跟随</Tag> : null}
+            {(cue.liveShift ?? 0) > 0 ? <Tag size="sm" colorScheme="orange">现场顺延</Tag> : null}
           </Flex>
           <Text color="whiteAlpha.500" fontSize="xs" noOfLines={1}>
             {cue.position} · {cue.channel} · {cue.color}
@@ -250,18 +267,31 @@ interface InspectorProps {
   roles: UserRole;
   workspace: Workspace;
   canEdit: boolean;
+  canDelay: boolean;
   conflicts: CueConflict[];
+  downstreamIds: Set<string>;
   onApply: (draft: Cue) => void;
   onDelete: () => void;
   onSelectCue: (cueId: string) => void;
+  onDelayChange: (seconds: number) => void;
 }
 
-function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDelete, onSelectCue }: InspectorProps) {
+function CueInspector({ cue, scene, workspace, canEdit, canDelay, conflicts, downstreamIds, onApply, onDelete, onSelectCue, onDelayChange }: InspectorProps) {
   const [draft, setDraft] = useState<Cue | null>(cue ? structuredClone(cue) : null);
+  const [delayDraft, setDelayDraft] = useState<string>('');
+
+  const delayInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     setDraft(cue ? structuredClone(cue) : null);
+    setDelayDraft(cue?.delaySeconds ? String(cue.delaySeconds) : '');
   }, [cue?.id]);
+
+  // 撤销/重做或在别处改动后，与已登记延迟保持一致（输入聚焦中不打断输入）
+  useEffect(() => {
+    if (delayInputRef.current === document.activeElement) return;
+    setDelayDraft(cue?.delaySeconds ? String(cue.delaySeconds) : '');
+  }, [cue?.delaySeconds]);
 
   if (!cue || !draft) {
     return (
@@ -278,16 +308,86 @@ function CueInspector({ cue, scene, workspace, canEdit, conflicts, onApply, onDe
     setDraft((current) => (current ? { ...current, [key]: value } : current));
   };
 
+  const effectiveShift = cue.liveShift ?? 0;
+  const downstreamCues = scene.cues.filter((item) => downstreamIds.has(item.id));
+
+  const commitDelay = () => {
+    const parsed = delayDraft.trim() === '' ? 0 : Number(delayDraft);
+    onDelayChange(Number.isFinite(parsed) ? Math.max(0, parsed) : 0);
+  };
+
   return (
     <VStack align="stretch" spacing={4}>
       <Flex align="center">
         <Box>
           <Heading size="sm">{cue.number} · {cue.label}</Heading>
-          <Text color="whiteAlpha.500" fontSize="xs">开始 {formatTime(cue.startTime)} · 总时长 {cue.duration?.toFixed(1)}s</Text>
+          <Text color="whiteAlpha.500" fontSize="xs">
+            计划 {formatTime(cue.startTime)}
+            {effectiveShift > 0 ? (
+              <> · <Text as="span" color="orange.300">现场 {formatTime(cue.liveStartTime)}（顺延 {formatDelay(effectiveShift)}）</Text></>
+            ) : null}
+            {' '}· 总时长 {cue.duration?.toFixed(1)}s
+          </Text>
         </Box>
         <Spacer />
         <Tag colorScheme={statusColors[cue.status]}>{statusLabels[cue.status]}</Tag>
       </Flex>
+
+      <Box p={3} borderRadius="lg" borderWidth="1px" borderStyle="dashed" borderColor="orange.600" bg="orange.900">
+        <Flex align="center" gap={2} mb={2}>
+          <Clock3 size={15} color="#f6ad55" />
+          <Text fontWeight="700" fontSize="sm" color="orange.200">现场顺延</Text>
+          <Spacer />
+          {effectiveShift > 0 ? <Tag size="sm" colorScheme="orange">现场后移 {formatDelay(effectiveShift)}</Tag> : null}
+        </Flex>
+        <Flex align="flex-end" gap={2}>
+          <FormControl>
+            <FormLabel htmlFor="cue-delay" mb={1} fontSize="xs">延迟秒数（登记在本提示）</FormLabel>
+            <NumberInput
+              id="cue-delay"
+              min={0}
+              step={1}
+              precision={1}
+              value={delayDraft}
+              isDisabled={!canDelay}
+              onChange={(value) => setDelayDraft(value)}
+              onBlur={commitDelay}
+              aria-label={`${cue.number} 现场延迟秒数`}
+            >
+              <NumberInputField ref={delayInputRef} placeholder="0" />
+            </NumberInput>
+          </FormControl>
+          <Button
+            size="sm"
+            colorScheme="orange"
+            isDisabled={!canDelay}
+            onClick={commitDelay}
+          >
+            顺延
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            colorScheme="orange"
+            leftIcon={<RefreshCw size={13} />}
+            isDisabled={!canDelay || !(cue.delaySeconds ?? 0)}
+            onClick={() => {
+              setDelayDraft('');
+              onDelayChange(0);
+            }}
+          >
+            清空恢复计划
+          </Button>
+        </Flex>
+        <Text mt={2} color="orange.100" fontSize="11px" opacity={0.85}>
+          本提示登记后，它及{downstreamCues.length ? ` ${downstreamCues.length} 条跟随下游（${downstreamCues.map((item) => item.number).join('、')}）` : '其所有直接或间接跟随下游'}一起后移；其他提示仍按计划时间。清空延迟即恢复计划。
+        </Text>
+        {!canDelay ? (
+          <Text mt={1} color="orange.100" fontSize="11px">只读角色不能登记现场顺延。</Text>
+        ) : scene.frozen ? (
+          <Text mt={1} color="orange.100" fontSize="11px">冻结场次仍可补记现场顺延，不改变已确认的设计参数。</Text>
+        ) : null}
+      </Box>
 
       {!canEdit ? (
         <Alert status="warning" borderRadius="lg">
@@ -536,7 +636,7 @@ function ComparePlan({
       <Box borderWidth="1px" borderColor="whiteAlpha.100" borderRadius="lg" overflow="hidden" bg="blackAlpha.200">
         <Box px={3} py={2} bg={active ? 'blue.900' : 'whiteAlpha.50'}>
           <Text fontWeight="700" fontSize="sm">{plan.name}</Text>
-          <Text color="whiteAlpha.500" fontSize="xs">{scene?.name ?? '无对应场次'} · {formatTime(scene?.duration)}</Text>
+          <Text color="whiteAlpha.500" fontSize="xs">{scene?.name ?? '无对应场次'} · 计划 {formatTime(scene?.duration)}{(scene?.liveShift ?? 0) > 0 ? ` · 现场 ${formatTime(scene?.liveDuration)}` : ''}</Text>
         </Box>
         <VStack align="stretch" spacing={0}>
           {scene?.cues.map((cue) => (
@@ -545,7 +645,11 @@ function ComparePlan({
               <Text fontFamily="mono" fontSize="xs" color="amber.300" w="42px">{cue.number}</Text>
               <Box flex="1" minW={0}>
                 <Text fontSize="xs" noOfLines={1}>{cue.label}</Text>
-                <Text color="whiteAlpha.500" fontSize="10px">{formatTime(cue.startTime)} · {cue.channel} · {cue.brightness}%</Text>
+                <Text color={(cue.liveShift ?? 0) > 0 ? 'orange.300' : 'whiteAlpha.500'} fontSize="10px">
+                  {(cue.liveShift ?? 0) > 0
+                    ? `${formatTime(cue.liveStartTime)}（计划 ${formatTime(cue.startTime)}）· ${cue.channel} · ${cue.brightness}%`
+                    : `${formatTime(cue.startTime)} · ${cue.channel} · ${cue.brightness}%`}
+                </Text>
               </Box>
               {active ? (
                 <IconButton aria-label={`选择 ${cue.number}`} size="xs" variant="ghost" icon={<ChevronRight size={14} />} onClick={() => onSelectCue(cue.id)} />
@@ -584,6 +688,13 @@ export default function App() {
     ? allConflicts.filter((item) => item.cueId === selectedCue.id)
     : [];
   const editable = canEditScene(workspace.role, activeScene);
+  const delayer = canRegisterDelay(workspace.role);
+  const delayedCount = activeScene?.cues.filter((cue) => (cue.liveShift ?? 0) > 0).length ?? 0;
+  const registeredCount = activeScene?.cues.filter((cue) => (cue.delaySeconds ?? 0) > 0).length ?? 0;
+  const downstreamIds = useMemo(
+    () => (activeScene && selectedCue ? collectDownstreamCueIds(activeScene.cues, selectedCue.id) : new Set<string>()),
+    [activeScene, selectedCue]
+  );
   const freezer = canFreeze(workspace.role);
   const incompleteCount = activePlan.scenes.flatMap((scene) => scene.cues).filter((cue) => cue.status !== 'confirmed').length;
 
@@ -644,10 +755,37 @@ export default function App() {
         ?.scenes.find((scene) => scene.id === next.selectedSceneId)
         ?.cues.find((item) => item.id === draft.id);
       if (!cue) return;
-      const { startTime: _start, duration: _duration, endTime: _end, ...fields } = draft;
+      const { startTime: _start, duration: _duration, endTime: _end, liveStartTime: _ls, liveEndTime: _le, liveShift: _shift, delaySeconds: _delay, ...fields } = draft;
       Object.assign(cue, fields);
     });
     toast({ title: '提示参数已应用', status: 'success', duration: 1800 });
+  }
+
+  function setCueDelay(seconds: number) {
+    if (!activeScene || !selectedCue || !delayer) return;
+    const value = Number(Math.max(0, Number(seconds) || 0).toFixed(1));
+    if (Math.abs(value - (selectedCue.delaySeconds ?? 0)) < 0.001) return;
+    commit(value > 0 ? `登记 ${selectedCue.number} 现场顺延 ${formatDelay(value)}` : `清空 ${selectedCue.number} 的现场顺延`, (next) => {
+      const cue = next.plans
+        .find((plan) => plan.id === next.activePlanId)
+        ?.scenes.find((scene) => scene.id === next.selectedSceneId)
+        ?.cues.find((item) => item.id === next.selectedCueId);
+      if (!cue) return;
+      cue.delaySeconds = value > 0 ? value : undefined;
+    });
+    if (value > 0) toast({ title: `已顺延，${collectDownstreamCueIds(activeScene.cues, selectedCue.id).size} 条下游同步后移`, status: 'success', duration: 1800 });
+  }
+
+  function clearSceneDelays() {
+    if (!activeScene || !delayer) return;
+    commit('清空本场全部现场顺延，恢复计划时间', (next) => {
+      const scene = next.plans
+        .find((plan) => plan.id === next.activePlanId)
+        ?.scenes.find((item) => item.id === next.selectedSceneId);
+      if (!scene) return;
+      scene.cues.forEach((cue) => { cue.delaySeconds = undefined; });
+    });
+    toast({ title: '现场顺延已清空，时间恢复计划', status: 'success', duration: 1800 });
   }
 
   function deleteCue() {
@@ -717,6 +855,7 @@ export default function App() {
         scene.cues.forEach((cue) => {
           cue.id = `${id}-${cue.id}`;
           cue.followCueId = cue.followCueId ? `${id}-${cue.followCueId}` : '';
+          cue.delaySeconds = undefined;
         });
       });
       next.plans.push(copy);
@@ -801,10 +940,28 @@ export default function App() {
   }
 
   function exportPlan() {
+    const liveDelays = activePlan.scenes.flatMap((scene) =>
+      scene.cues
+        .filter((cue) => (cue.liveShift ?? 0) > 0)
+        .map((cue) => ({
+          sceneId: scene.id,
+          sceneName: scene.name,
+          cueId: cue.id,
+          cueNumber: cue.number,
+          cueLabel: cue.label,
+          registeredDelay: cue.delaySeconds ?? 0,
+          effectiveShift: cue.liveShift ?? 0,
+          plannedStartTime: cue.startTime,
+          liveStartTime: cue.liveStartTime,
+          liveEndTime: cue.liveEndTime
+        }))
+    );
     const payload = {
       exportedAt: new Date().toISOString(),
       plan: activePlan,
       conflicts: activeConflicts,
+      liveConflicts: activeConflicts.filter((item) => item.type === 'live-channel-overlap' || item.type === 'live-follow-order'),
+      liveDelays,
       role: workspace.role
     };
     const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
@@ -929,6 +1086,7 @@ export default function App() {
                       </Flex>
                       <Flex mt={2} color="whiteAlpha.500" fontSize="10px" gap={2}>
                         <Text>{formatTime(scene.duration)}</Text>
+                        {(scene.liveShift ?? 0) > 0 ? <Text color="orange.300">现场 {formatDelay(scene.liveShift)}</Text> : null}
                         <Text>{scene.cues.length} 条</Text>
                         <Text color={sceneConflicts.length ? 'orange.300' : 'green.300'}>{sceneConflicts.length} 冲突</Text>
                       </Flex>
@@ -984,7 +1142,9 @@ export default function App() {
                       {activeScene.frozen ? <Tag colorScheme="green"><HStack spacing={1}><Lock size={12} /><Text>已冻结</Text></HStack></Tag> : <Tag variant="subtle">编辑中</Tag>}
                     </Flex>
                     <Text color="whiteAlpha.500" fontSize="sm" mt={1}>
-                      场次开始 {formatTime(activeScene.startTime)} · 时长 {formatTime(activeScene.duration)} · {activeScene.cues.length} 条提示
+                      场次开始 {formatTime(activeScene.startTime)} · 计划时长 {formatTime(activeScene.duration)}
+                      {delayedCount > 0 ? <> · <Text as="span" color="orange.300">现场时长 {formatTime(activeScene.liveDuration)}（{formatDelay(activeScene.liveShift)}）</Text></> : null}
+                      {' '}· {activeScene.cues.length} 条提示
                     </Text>
                   </Box>
                   <Spacer />
@@ -997,32 +1157,53 @@ export default function App() {
                   </ButtonGroup>
                 </Flex>
 
+                {delayedCount > 0 ? (
+                  <Alert status="warning" mt={3} borderRadius="lg" py={2} variant="left-accent">
+                    <AlertIcon />
+                    <Box flex="1">
+                      <Text fontSize="sm" fontWeight="650">现场已顺延：{registeredCount} 条登记延迟，{delayedCount} 条提示后移，场次整体 {formatDelay(activeScene.liveShift)}</Text>
+                      <Text color="whiteAlpha.600" fontSize="11px">顺延记录保存在当前方案草稿中，切换方案再回来仍在，导出 JSON 时一并带出。</Text>
+                    </Box>
+                    <Button size="xs" variant="ghost" colorScheme="orange" isDisabled={!delayer} onClick={clearSceneDelays}>清空本场顺延</Button>
+                  </Alert>
+                ) : null}
+
                 <Box mt={4}>
                   <Flex mb={2} align="center">
-                    <Text color="whiteAlpha.600" fontSize="xs">自动重算时间轴</Text>
+                    <Text color="whiteAlpha.600" fontSize="xs">自动重算时间轴{delayedCount > 0 ? <Text as="span" color="orange.300">（橙色描边为现场顺延）</Text> : null}</Text>
                     <Spacer />
-                    <Text color="whiteAlpha.500" fontSize="xs">{formatTime(activeScene.startTime)} — {formatTime((activeScene.startTime ?? 0) + (activeScene.duration ?? 0))}</Text>
+                    <Text color="whiteAlpha.500" fontSize="xs">
+                      {formatTime(activeScene.startTime)} — {formatTime((activeScene.startTime ?? 0) + (activeScene.duration ?? 0))}
+                      {delayedCount > 0 ? <Text as="span" color="orange.300"> · 现场至 {formatTime(activeScene.liveEndTime)}</Text> : null}
+                    </Text>
                   </Flex>
                   <Flex className="timeline-track" role="list" aria-label={`${activeScene.name}时间轴`}>
-                    {activeScene.cues.map((cue) => (
-                      <Tooltip key={cue.id} label={`${cue.number} ${cue.label}，${formatTime(cue.startTime)} 开始，持续 ${cue.duration?.toFixed(1)} 秒`}>
+                    {activeScene.cues.map((cue) => {
+                      const shifted = (cue.liveShift ?? 0) > 0;
+                      return (
+                      <Tooltip key={cue.id} label={`${cue.number} ${cue.label}，计划 ${formatTime(cue.startTime)} 开始，持续 ${cue.duration?.toFixed(1)} 秒${shifted ? `；现场顺延 ${formatDelay(cue.liveShift)}，${formatTime(cue.liveStartTime)} 开始` : ''}`}>
                         <Box
                           as="button"
                           role="listitem"
                           className="timeline-block focus-ring"
-                          aria-label={`时间轴 ${cue.number} ${cue.label}`}
+                          aria-label={`时间轴 ${cue.number} ${cue.label}${shifted ? `，现场顺延 ${formatDelay(cue.liveShift)}` : ''}`}
                           bg={cue.colorHex}
                           color={cue.brightness > 55 ? '#111827' : '#fff'}
                           flexGrow={Math.max(1, cue.duration ?? 1)}
                           flexBasis={`${Math.max(40, (cue.duration ?? 1) * 14)}px`}
+                          boxShadow={shifted ? 'inset 0 0 0 2px #f6ad55' : undefined}
                           borderLeft={cue.id === selectedCue?.id ? '3px solid #f6c453' : undefined}
                           onClick={() => selectCue(activeScene.id, cue.id)}
                         >
-                          <Text fontWeight="800">{cue.number}</Text>
+                          <Flex align="center" gap={1}>
+                            <Text fontWeight="800">{cue.number}</Text>
+                            {shifted ? <Text fontSize="9px" fontWeight="800" color="#7c2d12">{formatDelay(cue.liveShift)}</Text> : null}
+                          </Flex>
                           <Text noOfLines={1}>{cue.label}</Text>
                         </Box>
                       </Tooltip>
-                    ))}
+                      );
+                    })}
                     {!activeScene.cues.length ? <Text p={3} color="whiteAlpha.500" fontSize="sm">时间轴暂无数据</Text> : null}
                   </Flex>
                 </Box>
@@ -1085,10 +1266,13 @@ export default function App() {
                       roles={workspace.role}
                       workspace={workspace}
                       canEdit={editable}
+                      canDelay={delayer}
                       conflicts={activeCueConflicts}
+                      downstreamIds={downstreamIds}
                       onApply={applyCue}
                       onDelete={deleteCue}
                       onSelectCue={(cueId) => selectCue(activeScene.id, cueId)}
+                      onDelayChange={setCueDelay}
                     />
                   ) : null}
                 </TabPanel>
@@ -1110,13 +1294,20 @@ export default function App() {
                               <Text fontFamily="mono" color="amber.300" fontSize="sm">{cue.number}</Text>
                               <Text fontWeight="600" fontSize="sm" noOfLines={1}>{cue.label}</Text>
                               <Spacer />
-                              <Text color="whiteAlpha.500" fontSize="xs">{formatTime(cue.startTime)}</Text>
+                              {(cue.liveShift ?? 0) > 0 ? (
+                                <Text color="orange.300" fontSize="xs" fontFamily="mono">{formatTime(cue.liveStartTime)} {formatDelay(cue.liveShift)}</Text>
+                              ) : (
+                                <Text color="whiteAlpha.500" fontSize="xs">{formatTime(cue.startTime)}</Text>
+                              )}
                             </Flex>
                             <Box ml={4} mt={3} borderLeftWidth="2px" borderColor={followed ? 'purple.400' : 'whiteAlpha.200'} pl={3}>
                               {followed ? (
                                 <>
                                   <Flex align="center" gap={1} color="purple.300" fontSize="xs"><ArrowDown size={12} />跟随 {followed.number} · {followed.label}</Flex>
-                                  <Text mt={1} color="whiteAlpha.500" fontSize="10px">目标结束时间 {formatTime(followed.endTime)}</Text>
+                                  <Text mt={1} color="whiteAlpha.500" fontSize="10px">
+                                    目标结束时间 {formatTime(followed.endTime)}
+                                    {(followed.liveShift ?? 0) > 0 ? ` · 现场 ${formatTime(followed.liveEndTime)}` : ''}
+                                  </Text>
                                 </>
                               ) : (
                                 <Flex align="center" gap={1} color="whiteAlpha.500" fontSize="xs"><Pause size={12} />按前一条结束或手动 GO 触发</Flex>

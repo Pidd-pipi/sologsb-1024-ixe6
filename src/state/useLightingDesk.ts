@@ -165,6 +165,11 @@ export function canEditScene(role: UserRole, scene: Scene | undefined) {
   return Boolean(scene && !scene.frozen && role !== 'readonly' && role !== 'stage-manager');
 }
 
+/** 现场顺延是执行期操作：只读角色不可登记；冻结场次仍允许舞台监督/设计补记。 */
+export function canRegisterDelay(role: UserRole) {
+  return role !== 'readonly';
+}
+
 export function canFreeze(role: UserRole) {
   return role === 'designer' || role === 'stage-manager';
 }
@@ -175,4 +180,10 @@ export function formatTime(value: number | undefined) {
   const seconds = Math.floor(safe % 60);
   const tenths = Math.floor((safe % 1) * 10);
   return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${tenths}`;
+}
+
+export function formatDelay(value: number | undefined) {
+  const seconds = Math.max(0, value ?? 0);
+  if (seconds < 0.05) return '0s';
+  return `+${Number(seconds.toFixed(1)).toString()}s`;
 }

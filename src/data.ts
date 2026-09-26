@@ -136,6 +136,30 @@ const tourPlan: LightingPlan = {
 
 export const samplePlans = [mainPlan, coolPlan, tourPlan];
 
+const round2 = (value: number) => Number(value.toFixed(2));
+
+/**
+ * 收集所有直接或间接跟随指定提示的下游提示 id（沿 followCueId 反向闭包）。
+ * 用访问集合防止跟随关系成环时无限递归。
+ */
+export function collectDownstreamCueIds(cues: Cue[], cueId: string): Set<string> {
+  const byParent = new Map<string, string[]>();
+  for (const cue of cues) {
+    if (!cue.followCueId) continue;
+    byParent.set(cue.followCueId, [...(byParent.get(cue.followCueId) ?? []), cue.id]);
+  }
+  const result = new Set<string>();
+  const visit = (id: string, trail: Set<string>) => {
+    for (const childId of byParent.get(id) ?? []) {
+      if (result.has(childId) || trail.has(childId)) continue;
+      result.add(childId);
+      visit(childId, new Set(trail).add(childId));
+    }
+  };
+  visit(cueId, new Set([cueId]));
+  return result;
+}
+
 export function recalculatePlans(plans: LightingPlan[]) {
   for (const plan of plans) {
     const scenes = [...plan.scenes].sort((a, b) => a.order - b.order);
@@ -143,19 +167,50 @@ export function recalculatePlans(plans: LightingPlan[]) {
     for (const scene of scenes) {
       scene.startTime = absoluteCursor;
       let sceneCursor = absoluteCursor;
+      // 先按顺序与跟随关系计算计划时间轴
       for (const item of scene.cues) {
         const duration = Math.max(0.1, item.fadeIn + item.hold + item.fadeOut);
-        item.duration = Number(duration.toFixed(2));
+        item.duration = round2(duration);
         const followed = item.followCueId
           ? scene.cues.find((candidate) => candidate.id === item.followCueId)
           : undefined;
         const followTime = followed?.endTime ? followed.endTime : sceneCursor;
-        item.startTime = Number(Math.max(sceneCursor, followTime).toFixed(2));
-        item.endTime = Number((item.startTime + duration).toFixed(2));
+        item.startTime = round2(Math.max(sceneCursor, followTime));
+        item.endTime = round2(item.startTime + duration);
         sceneCursor = Math.max(sceneCursor, item.endTime);
       }
-      scene.duration = Number(Math.max(0, sceneCursor - absoluteCursor).toFixed(2));
+      scene.duration = round2(Math.max(0, sceneCursor - absoluteCursor));
+      scene.endTime = sceneCursor;
       absoluteCursor = sceneCursor;
+
+      // 现场顺延：提示的有效后移 = 自身登记延迟 + 跟随链上游的有效后移。
+      // 其他未登记延迟、也不在下游闭包内的提示保持计划时间。
+      const byId = new Map(scene.cues.map((cue) => [cue.id, cue]));
+      const shiftCache = new Map<string, number>();
+      const resolveShift = (id: string, trail: Set<string>): number => {
+        const cached = shiftCache.get(id);
+        if (cached !== undefined) return cached;
+        const cue = byId.get(id);
+        const own = Math.max(0, cue?.delaySeconds || 0);
+        const parentId = cue?.followCueId && byId.has(cue.followCueId) && !trail.has(cue.followCueId) ? cue.followCueId : '';
+        const shift = parentId ? own + resolveShift(parentId, new Set(trail).add(parentId)) : own;
+        const value = round2(shift);
+        shiftCache.set(id, value);
+        return value;
+      };
+
+      let liveCursor = scene.startTime ?? 0;
+      for (const item of scene.cues) {
+        const shift = round2(resolveShift(item.id, new Set([item.id])));
+        item.liveShift = shift;
+        item.liveStartTime = round2((item.startTime ?? 0) + shift);
+        item.liveEndTime = round2((item.endTime ?? 0) + shift);
+        liveCursor = Math.max(liveCursor, item.liveEndTime);
+      }
+      scene.liveStartTime = scene.startTime;
+      scene.liveEndTime = round2(liveCursor);
+      scene.liveDuration = round2(Math.max(0, liveCursor - (scene.startTime ?? 0)));
+      scene.liveShift = round2(liveCursor - sceneCursor);
     }
   }
   return plans;
@@ -165,7 +220,7 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
   const conflicts: CueConflict[] = [];
   for (const plan of plans) {
     for (const scene of plan.scenes) {
-      const byChannel = new Map<string, Cue[]>();
+      const overlapTolerance = 0.01;
       const positions = new Map<string, Cue[]>();
       for (const item of scene.cues) {
         const errors: string[] = [];
@@ -185,6 +240,11 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             message: `${item.number} ${errors.join('、')}`
           });
         }
+        positions.set(item.position, [...(positions.get(item.position) ?? []), item]);
+      }
+
+      // 跟随关系：分别检查计划时间与现场（含顺延）时间
+      for (const item of scene.cues) {
         if (!item.followCueId) continue;
         const followed = scene.cues.find((candidate) => candidate.id === item.followCueId);
         if (!followed) {
@@ -197,7 +257,10 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             type: 'follow-order',
             message: `${item.number} 的跟随提示不存在于当前场次`
           });
-        } else if ((followed.startTime ?? 0) >= (item.startTime ?? 0)) {
+          continue;
+        }
+        const planViolated = (followed.startTime ?? 0) >= (item.startTime ?? 0);
+        if (planViolated) {
           conflicts.push({
             id: `${plan.id}-${scene.id}-${item.id}-follow-order`,
             planId: plan.id,
@@ -207,25 +270,64 @@ export function detectConflicts(plans: LightingPlan[]): CueConflict[] {
             type: 'follow-order',
             message: `${item.number} 的跟随目标不在其之前完成`
           });
-        }
-      }
-
-      const sorted = [...scene.cues].sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0));
-      for (const item of sorted) {
-        const previous = byChannel.get(item.channel)?.at(-1);
-        if (previous && (item.startTime ?? 0) < (previous.endTime ?? 0) - 0.01) {
+        } else if ((followed.liveEndTime ?? followed.endTime ?? 0) > (item.liveStartTime ?? item.startTime ?? 0) + overlapTolerance) {
+          const seconds = round2((followed.liveEndTime ?? 0) - (item.liveStartTime ?? 0));
           conflicts.push({
-            id: `${plan.id}-${scene.id}-${item.id}-overlap`,
+            id: `${plan.id}-${scene.id}-${item.id}-live-follow-order`,
             planId: plan.id,
             sceneId: scene.id,
             cueId: item.id,
             severity: 'warning',
-            type: 'channel-overlap',
-            message: `${previous.number} 与 ${item.number} 在同通道 ${item.channel} 叠光`
+            type: 'live-follow-order',
+            message: `现场顺延 ${seconds.toFixed(1)} 秒：${item.number} 启动早于跟随目标 ${followed.number} 结束，下游未顺延或顺延不足`
           });
         }
+      }
+
+      // 同通道叠光：分别比对计划时间对与现场（含顺延）时间对
+      const byChannel = new Map<string, Cue[]>();
+      for (const item of scene.cues) {
+        if (!item.channel.trim()) continue;
         byChannel.set(item.channel, [...(byChannel.get(item.channel) ?? []), item]);
-        positions.set(item.position, [...(positions.get(item.position) ?? []), item]);
+      }
+      for (const [channel, items] of byChannel) {
+        if (items.length < 2) continue;
+        for (let index = 0; index < items.length; index += 1) {
+          for (let other = index + 1; other < items.length; other += 1) {
+            const a = items[index];
+            const b = items[other];
+            const first = (a.startTime ?? 0) <= (b.startTime ?? 0) ? a : b;
+            const second = first === a ? b : a;
+            const planOverlap = (second.startTime ?? 0) < (first.endTime ?? 0) - overlapTolerance;
+            if (planOverlap) {
+              conflicts.push({
+                id: `${plan.id}-${scene.id}-${first.id}-${second.id}-overlap`,
+                planId: plan.id,
+                sceneId: scene.id,
+                cueId: second.id,
+                severity: 'warning',
+                type: 'channel-overlap',
+                message: `${first.number} 与 ${second.number} 在同通道 ${channel} 叠光`
+              });
+              continue;
+            }
+            const liveFirstStart = first.liveStartTime ?? first.startTime ?? 0;
+            const liveFirstEnd = first.liveEndTime ?? first.endTime ?? 0;
+            const liveSecondStart = second.liveStartTime ?? second.startTime ?? 0;
+            if (liveSecondStart < liveFirstEnd - overlapTolerance) {
+              const seconds = round2(liveFirstEnd - liveSecondStart);
+              conflicts.push({
+                id: `${plan.id}-${scene.id}-${first.id}-${second.id}-live-overlap`,
+                planId: plan.id,
+                sceneId: scene.id,
+                cueId: second.id,
+                severity: 'warning',
+                type: 'live-channel-overlap',
+                message: `现场顺延造成叠光 ${seconds.toFixed(1)} 秒：${first.number} 与 ${second.number} 在同通道 ${channel} 重叠`
+              });
+            }
+          }
+        }
       }
 
       for (const [position, items] of positions) {

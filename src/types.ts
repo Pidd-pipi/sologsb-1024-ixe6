@@ -18,9 +18,15 @@ export interface Cue {
   targetNote: string;
   notes: string;
   status: CueStatus;
+  /** 现场登记的顺延秒数：仅作用于本提示，跟随它的下游提示会连带后移。 */
+  delaySeconds?: number;
   startTime?: number;
   duration?: number;
   endTime?: number;
+  /** 现场时间轴：计划开始时间叠加自身与跟随链上游的顺延后得出。 */
+  liveStartTime?: number;
+  liveEndTime?: number;
+  liveShift?: number;
 }
 
 export interface Scene {
@@ -30,6 +36,11 @@ export interface Scene {
   frozen: boolean;
   startTime?: number;
   duration?: number;
+  endTime?: number;
+  liveStartTime?: number;
+  liveDuration?: number;
+  liveEndTime?: number;
+  liveShift?: number;
   cues: Cue[];
 }
 
@@ -47,7 +58,14 @@ export interface CueConflict {
   cueId: string;
   sceneId: string;
   severity: ConflictSeverity;
-  type: 'channel-overlap' | 'follow-order' | 'missing-data' | 'duplicate-position' | 'duration';
+  type:
+    | 'channel-overlap'
+    | 'live-channel-overlap'
+    | 'follow-order'
+    | 'live-follow-order'
+    | 'missing-data'
+    | 'duplicate-position'
+    | 'duration';
   message: string;
 }
 
